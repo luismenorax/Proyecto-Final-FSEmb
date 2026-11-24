@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <SDL.h>
+#include <signal.h>
 
 #define SCREEN_W 1280
 #define SCREEN_H 720
@@ -34,9 +35,38 @@ static const unsigned char font[26][7] = {
     {17,17,10,4,4,4,4}, {31,1,2,4,8,16,31}
 };
 
+static const unsigned char digits[10][7] = {
+    {14,17,19,21,25,17,14}, // 0
+    {4,12,4,4,4,4,14},      // 1
+    {14,17,1,2,4,8,31},     // 2
+    {30,1,1,14,1,1,30},     // 3
+    {2,6,10,18,31,2,2},    // 4
+    {31,16,16,30,1,1,30},   // 5
+    {14,16,16,30,17,17,14},// 6
+    {31,1,2,4,8,8,8},      // 7
+    {14,17,17,14,17,17,14},// 8
+    {14,17,17,15,1,1,14}   // 9
+};
+
 static SDL_Window *window;
 static SDL_Renderer *renderer;
 static SDL_Joystick *joystick;
+
+static void open_joystick(void)
+{
+    if (joystick)
+        return;
+
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        joystick = SDL_JoystickOpen(i);
+
+        if (joystick) {
+            printf("Control detectado: %s\n",
+                   SDL_JoystickName(joystick));
+            return;
+        }
+    }
+}
 
 static char *roms[MAX_ROMS];
 static int rom_count = 0;
@@ -48,10 +78,16 @@ static void draw_text(SDL_Renderer *r, int x, int y,
 
     for (const char *p = text; *p; p++) {
         char c = (char)toupper((unsigned char)*p);
+        const unsigned char *glyph = NULL;
 
         if (c >= 'A' && c <= 'Z') {
-            const unsigned char *glyph = font[c - 'A'];
+            glyph = font[c - 'A'];
+        }
+        else if (c >= '0' && c <= '9') {
+            glyph = digits[c - '0'];
+        }
 
+        if (glyph) {
             for (int row = 0; row < 7; row++) {
                 for (int col = 0; col < 5; col++) {
                     if (glyph[row] & (1 << (4 - col))) {
@@ -140,14 +176,7 @@ static int init_sdl(void)
     SDL_RenderSetLogicalSize(renderer, SCREEN_W, SCREEN_H);
     SDL_JoystickEventState(SDL_ENABLE);
 
-    if (SDL_NumJoysticks() > 0) {
-        joystick = SDL_JoystickOpen(0);
-
-        if (joystick) {
-            printf("Control detectado: %s\n",
-                   SDL_JoystickName(joystick));
-        }
-    }
+	open_joystick();
 
     return 0;
 }
@@ -240,7 +269,6 @@ static int launch_game(const char *filename)
 
     /*
      * Liberar SDL antes de iniciar mGBA.
-     * Ambos programas utilizan SDL y la salida de video.
      */
     close_sdl();
 
@@ -260,17 +288,109 @@ static int launch_game(const char *filename)
         _exit(127);
     }
 
-    int status;
+    /*
+     * Supervisar el control desde el proceso principal.
+     * Solo se inicializa el subsistema de joystick,
+     * sin crear una ventana ni utilizar el video.
+     */
+    SDL_Joystick *game_joystick = NULL;
 
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            perror("waitpid");
-            break;
+    if (SDL_Init(SDL_INIT_JOYSTICK) < 0) {
+        fprintf(stderr, "No se pudo inicializar el joystick: %s\n",
+                SDL_GetError());
+    } else {
+        SDL_JoystickEventState(SDL_ENABLE);
+
+        if (SDL_NumJoysticks() > 0) {
+            game_joystick = SDL_JoystickOpen(0);
+
+            if (!game_joystick) {
+                fprintf(stderr, "No se pudo abrir el control: %s\n",
+                        SDL_GetError());
+            }
         }
     }
 
     /*
-     * Recuperar SDL y el control al cerrar el emulador.
+     * Botón central: índice 8.
+     * Mantener presionado durante 2 segundos para salir.
+     */
+    const int exit_button = 8;
+    const Uint32 hold_time = 2000;
+
+    Uint32 press_start = 0;
+    int button_held = 0;
+    int exit_requested = 0;
+
+    int status = 0;
+
+    while (1) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+
+        if (result == pid)
+            break;
+
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+
+            perror("waitpid");
+            break;
+        }
+
+        if (game_joystick &&
+            SDL_JoystickNumButtons(game_joystick) > exit_button) {
+
+            SDL_JoystickUpdate();
+
+            if (SDL_JoystickGetButton(game_joystick, exit_button)) {
+
+                Uint32 now = SDL_GetTicks();
+
+                if (!button_held) {
+                    press_start = now;
+                    button_held = 1;
+                } else if ((Uint32)(now - press_start) >= hold_time) {
+
+                    printf("Cerrando juego...\n");
+
+                    if (kill(pid, SIGTERM) == 0)
+                        exit_requested = 1;
+
+                    break;
+                }
+
+            } else {
+                button_held = 0;
+            }
+        }
+
+        SDL_Delay(10);
+    }
+
+    /*
+     * Esperar a que mGBA termine después de recibir SIGTERM.
+     */
+    if (exit_requested || (waitpid(pid, &status, WNOHANG) == 0)) {
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) {
+                perror("waitpid");
+                break;
+            }
+        }
+    }
+
+    /*
+     * Liberar el joystick y SDL antes de recuperar
+     * la interfaz gráfica.
+     */
+    if (game_joystick)
+        SDL_JoystickClose(game_joystick);
+
+    SDL_Quit();
+
+    /*
+     * Recuperar la interfaz principal.
      */
     if (init_sdl() < 0)
         return -1;
@@ -307,13 +427,24 @@ static void draw_library(int selected, int scroll)
 
         SDL_RenderFillRect(renderer, &row);
 
+        char number[16];
+        snprintf(number, sizeof(number), "%d.", index + 1);
+
         draw_text(renderer, 150, 173 + i * 48,
+                  number,
+                  (SDL_Color){160, 175, 195, 255}, 2);
+
+        draw_text(renderer, 190, 173 + i * 48,
                   roms[index],
                   (SDL_Color){255, 255, 255, 255}, 2);
     }
 
-    draw_centered(renderer, 635, "A ELEGIR   B REGRESAR",
-                  (SDL_Color){160, 175, 195, 255}, 2);
+	draw_centered(renderer, 610, "CRUCETA MOVER",
+              (SDL_Color){160, 175, 195, 255}, 2);
+
+	draw_centered(renderer, 650, "A ELEGIR   B REGRESAR",
+              (SDL_Color){160, 175, 195, 255}, 2);
+
 }
 
 int main(void)
@@ -327,6 +458,7 @@ int main(void)
     int library_scroll = 0;
 
     Uint32 last_navigation = 0;
+	Uint32 last_rom_scan = 0;
 
     if (init_sdl() < 0)
         return 1;
@@ -378,6 +510,27 @@ int main(void)
                         break;
                 }
             }
+
+			/* Detectar conexión de controles */
+			if (event.type == SDL_JOYDEVICEADDED) {
+    			printf("Se conectó un control.\n");
+    			open_joystick();
+			}
+
+			/* Detectar desconexión de controles */
+			if (event.type == SDL_JOYDEVICEREMOVED) {
+    			if (joystick &&
+        			SDL_JoystickInstanceID(joystick) == event.jdevice.which) {
+
+        			printf("Se desconectó el control.\n");
+
+			        SDL_JoystickClose(joystick);
+        			joystick = NULL;
+
+			        /* Buscar otro control disponible */
+        			open_joystick();
+    			}
+			}
 
             if (event.type == SDL_JOYBUTTONDOWN) {
                 if (event.jbutton.button == 0)
@@ -460,12 +613,43 @@ int main(void)
                     }
 
                     free(game);
+
+					scan_roms();
+
+					if (rom_count == 0) {
+					    library_selected = 0;
+					    library_scroll = 0;
+					} else if (library_selected >= rom_count) {
+					    library_selected = rom_count - 1;
+					}
+
                 }
             }
         }
 
-        if (back && screen != 0)
-            screen = 0;
+		if (back && screen != 0)
+		    screen = 0;
+
+		/* Actualizar la biblioteca mientras permanece abierta */
+		if (screen == 1 && now - last_rom_scan >= 1000) {
+		    scan_roms();
+
+		    if (rom_count == 0) {
+		        library_selected = 0;
+		        library_scroll = 0;
+		    } else {
+		        if (library_selected >= rom_count)
+		            library_selected = rom_count - 1;
+
+		        if (library_selected < library_scroll)
+		            library_scroll = library_selected;
+
+		        if (library_selected >= library_scroll + VISIBLE_ROMS)
+		            library_scroll = library_selected - VISIBLE_ROMS + 1;
+		    }
+
+		    last_rom_scan = now;
+		}
 
         /* Dibujar */
         SDL_SetRenderDrawColor(renderer, 17, 22, 32, 255);
@@ -479,11 +663,11 @@ int main(void)
             draw_card(renderer, 500, selected == 1, systems[1]);
             draw_card(renderer, 890, selected == 2, systems[2]);
 
-            draw_centered(renderer, 560, "MOVER",
-                          (SDL_Color){160, 175, 195, 255}, 3);
+			draw_centered(renderer, 565, "CRUCETA MOVER",
+            			  (SDL_Color){160, 175, 195, 255}, 2);
 
-            draw_centered(renderer, 610, "ELEGIR",
-                          (SDL_Color){160, 175, 195, 255}, 3);
+			draw_centered(renderer, 610, "A ELEGIR",
+            			  (SDL_Color){160, 175, 195, 255}, 2);
 
         } else if (screen == 1) {
             draw_library(library_selected, library_scroll);
