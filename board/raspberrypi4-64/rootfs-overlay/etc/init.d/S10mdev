@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# Run the mdev daemon
+#
+
+DAEMON="mdev"
+PIDFILE="/var/run/$DAEMON.pid"
+
+
+start() {
+	echo -n "Starting $DAEMON... "
+	# Registro persistente de eventos mdev
+	mkdir -p /home/pi/roms
+	touch /home/pi/roms/mdev.log
+	ln -sf /home/pi/roms/mdev.log /dev/mdev.log
+
+	start-stop-daemon -S -b -m -p $PIDFILE -x /sbin/mdev -- -df
+	[ $? -eq 0 ] && echo "OK" || echo "ERROR"
+
+	# coldplug modules
+	find /sys/ -name modalias -print0 | \
+		xargs -0 sort -u | \
+		tr '\n' '\0' | \
+		xargs -0 modprobe -abq
+}
+
+stop() {
+	echo -n "Stopping $DAEMON... "
+	start-stop-daemon -K -p $PIDFILE
+	[ $? -eq 0 ] && echo "OK" || echo "ERROR"
+}
+
+restart() {
+	stop
+	start
+}
+
+case "$1" in
+  start|stop|restart)
+	"$1"
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

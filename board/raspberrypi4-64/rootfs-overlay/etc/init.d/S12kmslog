@@ -1,0 +1,45 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        mkdir -p /var/log
+
+        {
+            echo "===== FECHA ====="
+            date
+
+            echo
+            echo "===== VERSION DEL KERNEL ====="
+            uname -a
+
+            echo
+            echo "===== LINEA DE COMANDOS ====="
+            cat /proc/cmdline
+
+            echo
+            echo "===== REGISTRO DEL KERNEL ====="
+            dmesg
+
+            echo
+            echo "===== FRAMEBUFFER ====="
+            cat /proc/fb
+
+            echo
+            echo "===== DISPOSITIVOS DRM ====="
+            ls -la /dev/dri
+
+            echo
+            echo "===== CONECTORES DRM ====="
+            for d in /sys/class/drm/card*-*; do
+                [ -d "$d" ] || continue
+                echo "--- $d ---"
+                cat "$d/status" 2>/dev/null
+                cat "$d/modes" 2>/dev/null
+            done
+        } > /var/log/kms-boot.log 2>&1
+
+        sync
+        ;;
+esac
+
+exit 0

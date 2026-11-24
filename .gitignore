@@ -1,0 +1,25 @@
+# Árbol local de Buildroot
+/buildroot-2026.08.2/
+/buildroot-2026.08.2.tar.xz
+
+# Configuraciones antiguas y duplicados locales
+/config-base.config
+/joystick.c
+
+# Imágenes y archivos generados
+*.img
+*.img.gz
+*.ext4
+*.o
+*.a
+*.so
+*.sav
+*.log
+
+# Archivos temporales
+*.bak
+*~
+
+# Binarios locales de la interfaz y pruebas
+/src/interfaz/consola-ui
+/src/interfaz/prueba-sdl2
