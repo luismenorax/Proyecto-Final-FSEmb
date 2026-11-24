@@ -15,7 +15,13 @@
 #define SCREEN_W 1280
 #define SCREEN_H 720
 #define FONT_SCALE 4
-#define ROM_DIR "/home/pi/roms/gba"
+static const char *system_dirs[] = {
+    "/home/pi/roms/nes",
+    "/home/pi/roms/snes",
+    "/home/pi/roms/gba"
+};
+
+static const char *system_names[] = {"NES", "SNES", "GBA"};
 #define MAX_ROMS 512
 #define VISIBLE_ROMS 9
 
@@ -201,11 +207,21 @@ static void close_sdl(void)
     SDL_Quit();
 }
 
-static int is_gba_file(const char *name)
+static int is_rom_file(const char *name, int system)
 {
     size_t len = strlen(name);
 
-    return len > 4 && strcasecmp(name + len - 4, ".gba") == 0;
+    if (system == 0)
+        return len > 4 && strcasecmp(name + len - 4, ".nes") == 0;
+
+    if (system == 1)
+        return (len > 4 && strcasecmp(name + len - 4, ".sfc") == 0) ||
+               (len > 4 && strcasecmp(name + len - 4, ".smc") == 0);
+
+    if (system == 2)
+        return len > 4 && strcasecmp(name + len - 4, ".gba") == 0;
+
+    return 0;
 }
 
 static int compare_roms(const void *a, const void *b)
@@ -221,14 +237,17 @@ static void free_roms(void)
     rom_count = 0;
 }
 
-static void scan_roms(void)
+static void scan_roms(int system)
 {
     DIR *dir;
     struct dirent *entry;
 
+    if (system < 0 || system > 2)
+        return;
+
     free_roms();
 
-    dir = opendir(ROM_DIR);
+    dir = opendir(system_dirs[system]);
 
     if (!dir) {
         perror("No se pudo abrir el directorio de ROMs");
@@ -236,7 +255,7 @@ static void scan_roms(void)
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        if (!is_gba_file(entry->d_name))
+        if (!is_rom_file(entry->d_name, system))
             continue;
 
         if (rom_count >= MAX_ROMS)
@@ -252,15 +271,19 @@ static void scan_roms(void)
 
     qsort(roms, rom_count, sizeof(roms[0]), compare_roms);
 
-    printf("ROMs GBA encontradas: %d\n", rom_count);
+    printf("ROMs %s encontradas: %d\n",
+           system_names[system], rom_count);
 }
 
-static int launch_game(const char *filename)
+static int launch_game(const char *filename, int system)
 {
     char path[PATH_MAX];
 
+    if (system < 0 || system > 2)
+        return -1;
+
     if (snprintf(path, sizeof(path), "%s/%s",
-                 ROM_DIR, filename) >= (int)sizeof(path)) {
+                 system_dirs[system], filename) >= (int)sizeof(path)) {
         fprintf(stderr, "Ruta de ROM demasiado larga.\n");
         return -1;
     }
@@ -281,10 +304,22 @@ static int launch_game(const char *filename)
     }
 
     if (pid == 0) {
-        setenv("HOME", "/root", 1);
+        if (system == 2) {
+            setenv("HOME", "/root", 1);
 
-        execl("/usr/bin/mgba", "mgba", path, (char *)NULL);
-        perror("No se pudo ejecutar mGBA");
+            execl("/usr/bin/mgba", "mgba", path, (char *)NULL);
+            perror("No se pudo ejecutar mGBA");
+        } else {
+            setenv("HOME", "/home/pi", 1);
+
+            freopen("/home/pi/roms/mednafen.log", "w", stdout);
+            freopen("/home/pi/roms/mednafen.log", "a", stderr);
+
+            execl("/usr/bin/mednafen", "mednafen", path,
+                  (char *)NULL);
+            perror("No se pudo ejecutar Mednafen");
+        }
+
         _exit(127);
     }
 
@@ -398,16 +433,25 @@ static int launch_game(const char *filename)
     return 0;
 }
 
-static void draw_library(int selected, int scroll)
+static void draw_library(int selected, int scroll, int system)
 {
-    draw_centered(renderer, 55, "BIBLIOTECA GBA",
+    char title[64];
+    char empty_message[64];
+
+    snprintf(title, sizeof(title), "BIBLIOTECA %s",
+             system_names[system]);
+
+    snprintf(empty_message, sizeof(empty_message),
+             "NO HAY JUEGOS %s", system_names[system]);
+
+    draw_centered(renderer, 55, title,
                   (SDL_Color){255, 255, 255, 255}, 5);
 
     if (rom_count == 0) {
-        draw_centered(renderer, 300, "NO HAY JUEGOS GBA",
+        draw_centered(renderer, 300, empty_message,
                       (SDL_Color){180, 195, 215, 255}, 4);
 
-        draw_centered(renderer, 380, "COPIA ROMS A LA CARPETA GBA",
+        draw_centered(renderer, 380, "COPIA ROMS A LA CARPETA",
                       (SDL_Color){160, 175, 195, 255}, 2);
         return;
     }
@@ -594,19 +638,16 @@ int main(void)
         /* Seleccion */
         if (action) {
             if (screen == 0) {
-                if (selected == 2) {
-                    scan_roms();
-                    library_selected = 0;
-                    library_scroll = 0;
-                    screen = 1;
-                } else {
-                    screen = 2;
-                }
+                scan_roms(selected);
+                library_selected = 0;
+                library_scroll = 0;
+                last_rom_scan = now;
+                screen = 1;
             } else if (screen == 1 && rom_count > 0) {
                 char *game = strdup(roms[library_selected]);
 
                 if (game) {
-                    if (launch_game(game) < 0) {
+                    if (launch_game(game, selected) < 0) {
                         free(game);
                         running = 0;
                         continue;
@@ -614,7 +655,7 @@ int main(void)
 
                     free(game);
 
-					scan_roms();
+					scan_roms(selected);
 
 					if (rom_count == 0) {
 					    library_selected = 0;
@@ -632,7 +673,7 @@ int main(void)
 
 		/* Actualizar la biblioteca mientras permanece abierta */
 		if (screen == 1 && now - last_rom_scan >= 1000) {
-		    scan_roms();
+		    scan_roms(selected);
 
 		    if (rom_count == 0) {
 		        library_selected = 0;
@@ -670,7 +711,7 @@ int main(void)
             			  (SDL_Color){160, 175, 195, 255}, 2);
 
         } else if (screen == 1) {
-            draw_library(library_selected, library_scroll);
+            draw_library(library_selected, library_scroll, selected);
 
         } else {
             draw_centered(renderer, 160, systems[selected],

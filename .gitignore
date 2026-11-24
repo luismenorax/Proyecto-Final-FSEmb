@@ -19,6 +19,7 @@
 # Archivos temporales
 *.bak
 *~
+*.backup
 
 # Binarios locales de la interfaz y pruebas
 /src/interfaz/consola-ui
