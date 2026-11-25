@@ -33,7 +33,7 @@ cd Proyecto-Final-FSEmb
 - Interfaz en **C y SDL2** (backend KMSDRM) con menú de sistemas y bibliotecas de ROM.
 - Emuladores: **mGBA** (GBA) y **Mednafen 1.32.1** (NES y SNES).
 - Gráficos acelerados con **VC4/V3D + Mesa**; audio con **ALSA** (48 kHz, estéreo, 16 bits).
-- **Importación automática de ROM desde USB** (mdev), sin duplicados (SHA-256) y con copia verificada.
+- **Importación automática de ROM desde USB** (mdev), sin duplicados y con copia verificada.
 - Soporte de mando Xbox Series S|X: navegación por botones, cruceta y stick izquierdo.
 
 ## Estructura del entregable
@@ -69,7 +69,6 @@ sudo apt install -y build-essential git libncurses-dev rsync wget cpio unzip bc 
 Por su tamaño, la imagen no se incluye en el archivo comprimido del entregable:
 
 - **Descargar `sdcard.tar.xz` (60.6 MB):** <https://drive.google.com/file/d/1_sUsdZnyIM_OBg7NA-MP80DaNaQAcw4l/view?usp=sharing>
-- **SHA-256:** `PEGAR_AQUI_EL_HASH_DE_LA_IMAGEN`
 
 > **Importante:** el archivo `sdcard.tar.xz` **sólo puede descomprimirse en Linux**
 > (no en Windows ni en macOS). Descomprimirlo en un equipo Linux antes de grabarlo:
