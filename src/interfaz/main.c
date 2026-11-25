@@ -15,6 +15,7 @@
 #define SCREEN_W 1280
 #define SCREEN_H 720
 #define FONT_SCALE 4
+
 static const char *system_dirs[] = {
     "/home/pi/roms/nes",
     "/home/pi/roms/snes",
@@ -22,8 +23,12 @@ static const char *system_dirs[] = {
 };
 
 static const char *system_names[] = {"NES", "SNES", "GBA"};
+
 #define MAX_ROMS 512
 #define VISIBLE_ROMS 9
+
+#define IMPORT_STATUS_FILE "/tmp/rom-usb-import.status"
+#define IMPORT_RESULTS_FILE "/tmp/rom-usb-import-results.txt"
 
 static const unsigned char font[26][7] = {
     {14,17,17,31,17,17,17}, {30,17,17,30,17,17,30},
@@ -42,21 +47,32 @@ static const unsigned char font[26][7] = {
 };
 
 static const unsigned char digits[10][7] = {
-    {14,17,19,21,25,17,14}, // 0
-    {4,12,4,4,4,4,14},      // 1
-    {14,17,1,2,4,8,31},     // 2
-    {30,1,1,14,1,1,30},     // 3
-    {2,6,10,18,31,2,2},    // 4
-    {31,16,16,30,1,1,30},   // 5
-    {14,16,16,30,17,17,14},// 6
-    {31,1,2,4,8,8,8},      // 7
-    {14,17,17,14,17,17,14},// 8
-    {14,17,17,15,1,1,14}   // 9
+    {14,17,19,21,25,17,14},
+    {4,12,4,4,4,4,14},
+    {14,17,1,2,4,8,31},
+    {30,1,1,14,1,1,30},
+    {2,6,10,18,31,2,2},
+    {31,16,16,30,1,1,30},
+    {14,16,16,30,17,17,14},
+    {31,1,2,4,8,8,8},
+    {14,17,17,14,17,17,14},
+    {14,17,17,15,1,1,14}
 };
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
 static SDL_Joystick *joystick;
+
+static void stop_psplash(void)
+{
+    if (access("/usr/bin/psplash-write", X_OK) == 0) {
+        int result = system(
+            "/usr/bin/psplash-write \"QUIT\" >/dev/null 2>&1"
+        );
+
+        (void)result;
+    }
+}
 
 static void open_joystick(void)
 {
@@ -182,8 +198,6 @@ static int init_sdl(void)
     SDL_RenderSetLogicalSize(renderer, SCREEN_W, SCREEN_H);
     SDL_JoystickEventState(SDL_ENABLE);
 
-	open_joystick();
-
     return 0;
 }
 
@@ -275,6 +289,82 @@ static void scan_roms(int system)
            system_names[system], rom_count);
 }
 
+static int read_import_status(char *status, size_t size)
+{
+    FILE *file = fopen(IMPORT_STATUS_FILE, "r");
+
+    if (!file) {
+        return 0;
+    }
+
+    if (!fgets(status, (int)size, file)) {
+        fclose(file);
+        return 0;
+    }
+
+    fclose(file);
+
+    status[strcspn(status, "\r\n")] = '\0';
+
+    FILE *log = fopen("/home/pi/roms/usb-debug.log", "a");
+    if (log) {
+        fprintf(log, "Interfaz detectó estado: %s\n", status);
+        fclose(log);
+    }
+
+    return 1;
+}
+
+static void draw_import_screen(int finished, int failed)
+{
+    SDL_SetRenderDrawColor(renderer, 17, 22, 32, 255);
+    SDL_RenderClear(renderer);
+
+    if (!finished) {
+        draw_centered(renderer, 190, "IMPORTANDO ROMS",
+                      (SDL_Color){255, 255, 255, 255}, 5);
+        draw_centered(renderer, 310, "NO RETIRES LA MEMORIA USB",
+                      (SDL_Color){180, 195, 215, 255}, 2);
+        draw_centered(renderer, 380, "EL JUEGO ESTA EN PAUSA",
+                      (SDL_Color){100, 190, 255, 255}, 2);
+    } else {
+        draw_centered(renderer, 65,
+                      failed ? "ERROR EN IMPORTACION" : "ROMS IMPORTADAS",
+                      (SDL_Color){255, 255, 255, 255}, 4);
+
+        FILE *file = fopen(IMPORT_RESULTS_FILE, "r");
+        char line[PATH_MAX];
+        int row = 0;
+
+        if (file) {
+            while (row < 8 && fgets(line, sizeof(line), file)) {
+                line[strcspn(line, "\r\n")] = '\0';
+
+                if (line[0] == '\0')
+                    continue;
+
+                draw_centered(renderer, 150 + row * 43, line,
+                              (SDL_Color){180, 220, 255, 255}, 2);
+                row++;
+            }
+
+            fclose(file);
+        }
+
+        if (row == 0) {
+            draw_centered(renderer, 250, "NO SE IMPORTARON ROMS NUEVAS",
+                          (SDL_Color){180, 195, 215, 255}, 2);
+        }
+
+        draw_centered(renderer, 555, "A CONTINUAR JUGANDO",
+                      (SDL_Color){100, 220, 140, 255}, 2);
+        draw_centered(renderer, 610, "B VOLVER AL MENU",
+                      (SDL_Color){100, 190, 255, 255}, 2);
+    }
+
+    SDL_RenderPresent(renderer);
+}
+
 static int launch_game(const char *filename, int system)
 {
     char path[PATH_MAX];
@@ -291,15 +381,20 @@ static int launch_game(const char *filename, int system)
     printf("Iniciando: %s\n", path);
 
     /*
-     * Liberar SDL antes de iniciar mGBA.
+     * Eliminar el estado de una importación anterior antes de iniciar
+     * el emulador. El importador publicará STARTED/DONE durante esta partida.
      */
+    unlink(IMPORT_STATUS_FILE);
+    unlink(IMPORT_RESULTS_FILE);
+
     close_sdl();
 
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("fork");
-        init_sdl();
+        if (init_sdl() == 0)
+            open_joystick();
         return -1;
     }
 
@@ -323,11 +418,6 @@ static int launch_game(const char *filename, int system)
         _exit(127);
     }
 
-    /*
-     * Supervisar el control desde el proceso principal.
-     * Solo se inicializa el subsistema de joystick,
-     * sin crear una ventana ni utilizar el video.
-     */
     SDL_Joystick *game_joystick = NULL;
 
     if (SDL_Init(SDL_INIT_JOYSTICK) < 0) {
@@ -346,16 +436,17 @@ static int launch_game(const char *filename, int system)
         }
     }
 
-    /*
-     * Botón central: índice 8.
-     * Mantener presionado durante 2 segundos para salir.
-     */
     const int exit_button = 8;
     const Uint32 hold_time = 2000;
 
     Uint32 press_start = 0;
     int button_held = 0;
     int exit_requested = 0;
+    int return_to_menu = 0;
+    int import_screen = 0;
+    int import_finished = 0;
+    int import_failed = 0;
+    int import_handled = 0;
 
     int status = 0;
 
@@ -373,20 +464,160 @@ static int launch_game(const char *filename, int system)
             break;
         }
 
+        char import_status[32];
+
+        if (!import_handled &&
+            read_import_status(import_status, sizeof(import_status))) {
+
+            if (!import_screen &&
+                (strcmp(import_status, "STARTED") == 0 ||
+                 strcmp(import_status, "DONE") == 0 ||
+                 strcmp(import_status, "FAILED") == 0)) {
+                printf("Importación USB detectada. Pausando emulador.\n");
+
+                FILE *log = fopen("/home/pi/roms/usb-debug.log", "a");
+                if (log) {
+                    fprintf(log, "Intentando pausar PID: %d\n", pid);
+                    fclose(log);
+                }
+                
+                int stop_result = kill(pid, SIGSTOP);
+                int stop_error = errno;
+
+                log = fopen("/home/pi/roms/usb-debug.log", "a");
+                if (log) {
+                    fprintf(log,
+                            "SIGSTOP: PID=%d, resultado=%d, errno=%d (%s)\n",
+                            pid, stop_result, stop_error, strerror(stop_error));
+                    fclose(log);
+                }
+
+                if (stop_result == 0) {
+                    import_screen = 1;
+                    import_finished = strcmp(import_status, "STARTED") != 0;
+                    import_failed = strcmp(import_status, "FAILED") == 0;
+
+                    if (game_joystick) {
+                        SDL_JoystickClose(game_joystick);
+                        game_joystick = NULL;
+                    }
+
+                    SDL_Quit();
+
+                    if (init_sdl() == 0) {
+                        open_joystick();
+                    } else {
+                        fprintf(stderr,
+                                "No se pudo abrir la interfaz de importación.\n");
+                        kill(pid, SIGCONT);
+                        import_screen = 0;
+                        import_handled = 1;
+
+                        if (SDL_Init(SDL_INIT_JOYSTICK) == 0) {
+                            SDL_JoystickEventState(SDL_ENABLE);
+                            if (SDL_NumJoysticks() > 0)
+                                game_joystick = SDL_JoystickOpen(0);
+                        }
+                    }
+                } else {
+                    FILE *log = fopen("/home/pi/roms/usb-debug.log", "a");
+                    if (log) {
+                        fprintf(log, "ERROR al pausar PID: %d\n", pid);
+                        fclose(log);
+                    }
+                    
+                    perror("No se pudo pausar el emulador");
+                    import_handled = 1;
+                }
+            }
+
+            if (import_screen && strcmp(import_status, "DONE") == 0) {
+                import_finished = 1;
+                import_failed = 0;
+            } else if (import_screen &&
+                       strcmp(import_status, "FAILED") == 0) {
+                import_finished = 1;
+                import_failed = 1;
+            }
+        }
+
+        if (import_screen) {
+            SDL_Event event;
+            int choice = 0;
+
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_JOYBUTTONDOWN) {
+                    if (event.jbutton.button == 0 && import_finished)
+                        choice = 1;
+                    else if (event.jbutton.button == 1 && import_finished)
+                        choice = 2;
+                }
+
+                if (event.type == SDL_JOYDEVICEADDED)
+                    open_joystick();
+
+                if (event.type == SDL_JOYDEVICEREMOVED &&
+                    joystick &&
+                    SDL_JoystickInstanceID(joystick) == event.jdevice.which) {
+                    SDL_JoystickClose(joystick);
+                    joystick = NULL;
+                    open_joystick();
+                }
+            }
+
+            if (joystick)
+                SDL_JoystickUpdate();
+
+            draw_import_screen(import_finished, import_failed);
+
+            if (choice == 1) {
+                printf("Reanudando el juego.\n");
+
+                close_sdl();
+
+                if (SDL_Init(SDL_INIT_JOYSTICK) == 0) {
+                    SDL_JoystickEventState(SDL_ENABLE);
+
+                    if (SDL_NumJoysticks() > 0)
+                        game_joystick = SDL_JoystickOpen(0);
+                }
+
+                kill(pid, SIGCONT);
+                unlink(IMPORT_STATUS_FILE);
+                unlink(IMPORT_RESULTS_FILE);
+
+                import_screen = 0;
+                import_finished = 0;
+                import_failed = 0;
+                import_handled = 0;
+                press_start = 0;
+                button_held = 0;
+            } else if (choice == 2) {
+                printf("Cerrando juego y regresando al menú.\n");
+
+                kill(pid, SIGTERM);
+                kill(pid, SIGCONT);
+                exit_requested = 1;
+                return_to_menu = 1;
+                break;
+            }
+
+            SDL_Delay(16);
+            continue;
+        }
+
         if (game_joystick &&
             SDL_JoystickNumButtons(game_joystick) > exit_button) {
 
             SDL_JoystickUpdate();
 
             if (SDL_JoystickGetButton(game_joystick, exit_button)) {
-
                 Uint32 now = SDL_GetTicks();
 
                 if (!button_held) {
                     press_start = now;
                     button_held = 1;
                 } else if ((Uint32)(now - press_start) >= hold_time) {
-
                     printf("Cerrando juego...\n");
 
                     if (kill(pid, SIGTERM) == 0)
@@ -394,7 +625,6 @@ static int launch_game(const char *filename, int system)
 
                     break;
                 }
-
             } else {
                 button_held = 0;
             }
@@ -403,9 +633,6 @@ static int launch_game(const char *filename, int system)
         SDL_Delay(10);
     }
 
-    /*
-     * Esperar a que mGBA termine después de recibir SIGTERM.
-     */
     if (exit_requested || (waitpid(pid, &status, WNOHANG) == 0)) {
         while (waitpid(pid, &status, 0) < 0) {
             if (errno != EINTR) {
@@ -415,22 +642,20 @@ static int launch_game(const char *filename, int system)
         }
     }
 
-    /*
-     * Liberar el joystick y SDL antes de recuperar
-     * la interfaz gráfica.
-     */
     if (game_joystick)
         SDL_JoystickClose(game_joystick);
 
-    SDL_Quit();
+    if (import_screen)
+        close_sdl();
+    else
+        SDL_Quit();
 
-    /*
-     * Recuperar la interfaz principal.
-     */
     if (init_sdl() < 0)
         return -1;
 
-    return 0;
+    open_joystick();
+
+    return return_to_menu ? 1 : 0;
 }
 
 static void draw_library(int selected, int scroll, int system)
@@ -483,16 +708,22 @@ static void draw_library(int selected, int scroll, int system)
                   (SDL_Color){255, 255, 255, 255}, 2);
     }
 
-	draw_centered(renderer, 610, "CRUCETA MOVER",
-              (SDL_Color){160, 175, 195, 255}, 2);
+    draw_centered(renderer, 610, "CRUCETA MOVER",
+                  (SDL_Color){160, 175, 195, 255}, 2);
 
-	draw_centered(renderer, 650, "A ELEGIR   B REGRESAR",
-              (SDL_Color){160, 175, 195, 255}, 2);
-
+    draw_centered(renderer, 650, "A ELEGIR   B REGRESAR",
+                  (SDL_Color){160, 175, 195, 255}, 2);
 }
 
 int main(void)
 {
+    FILE *startup_log = fopen("/tmp/consola-startup.log", "w");
+
+    if (startup_log) {
+        fprintf(startup_log, "main() iniciado.\n");
+        fclose(startup_log);
+    }
+
     const char *systems[] = {"NES", "SNES", "GBA"};
 
     int running = 1;
@@ -502,12 +733,18 @@ int main(void)
     int library_scroll = 0;
 
     Uint32 last_navigation = 0;
-	Uint32 last_rom_scan = 0;
+    Uint32 last_rom_scan = 0;
+
+    /*
+     * Cerrar psplash antes de que SDL tome el control
+     * de la salida de video.
+     */
+    stop_psplash();
 
     if (init_sdl() < 0)
         return 1;
 
-    printf("Interfaz SDL2 iniciada.\n");
+    open_joystick();
 
     while (running) {
         SDL_Event event;
@@ -555,26 +792,23 @@ int main(void)
                 }
             }
 
-			/* Detectar conexión de controles */
-			if (event.type == SDL_JOYDEVICEADDED) {
-    			printf("Se conectó un control.\n");
-    			open_joystick();
-			}
+            if (event.type == SDL_JOYDEVICEADDED) {
+                printf("Se conectó un control.\n");
+                open_joystick();
+            }
 
-			/* Detectar desconexión de controles */
-			if (event.type == SDL_JOYDEVICEREMOVED) {
-    			if (joystick &&
-        			SDL_JoystickInstanceID(joystick) == event.jdevice.which) {
+            if (event.type == SDL_JOYDEVICEREMOVED) {
+                if (joystick &&
+                    SDL_JoystickInstanceID(joystick) == event.jdevice.which) {
 
-        			printf("Se desconectó el control.\n");
+                    printf("Se desconectó el control.\n");
 
-			        SDL_JoystickClose(joystick);
-        			joystick = NULL;
+                    SDL_JoystickClose(joystick);
+                    joystick = NULL;
 
-			        /* Buscar otro control disponible */
-        			open_joystick();
-    			}
-			}
+                    open_joystick();
+                }
+            }
 
             if (event.type == SDL_JOYBUTTONDOWN) {
                 if (event.jbutton.button == 0)
@@ -599,7 +833,6 @@ int main(void)
             }
         }
 
-        /* Lectura de ejes analogicos */
         if (joystick && SDL_JoystickNumAxes(joystick) >= 2) {
             Sint16 x = SDL_JoystickGetAxis(joystick, 0);
             Sint16 y = SDL_JoystickGetAxis(joystick, 1);
@@ -617,7 +850,6 @@ int main(void)
             }
         }
 
-        /* Navegacion */
         if (direction != 0 && now - last_navigation > 220) {
             if (screen == 0) {
                 selected = (selected + direction + 3) % 3;
@@ -635,7 +867,6 @@ int main(void)
             last_navigation = now;
         }
 
-        /* Seleccion */
         if (action) {
             if (screen == 0) {
                 scan_roms(selected);
@@ -647,7 +878,9 @@ int main(void)
                 char *game = strdup(roms[library_selected]);
 
                 if (game) {
-                    if (launch_game(game, selected) < 0) {
+                    int game_result = launch_game(game, selected);
+
+                    if (game_result < 0) {
                         free(game);
                         running = 0;
                         continue;
@@ -655,44 +888,48 @@ int main(void)
 
                     free(game);
 
-					scan_roms(selected);
+                    if (game_result == 1) {
+                        screen = 0;
+                        library_selected = 0;
+                        library_scroll = 0;
+                        continue;
+                    }
 
-					if (rom_count == 0) {
-					    library_selected = 0;
-					    library_scroll = 0;
-					} else if (library_selected >= rom_count) {
-					    library_selected = rom_count - 1;
-					}
+                    scan_roms(selected);
 
+                    if (rom_count == 0) {
+                        library_selected = 0;
+                        library_scroll = 0;
+                    } else if (library_selected >= rom_count) {
+                        library_selected = rom_count - 1;
+                    }
                 }
             }
         }
 
-		if (back && screen != 0)
-		    screen = 0;
+        if (back && screen != 0)
+            screen = 0;
 
-		/* Actualizar la biblioteca mientras permanece abierta */
-		if (screen == 1 && now - last_rom_scan >= 1000) {
-		    scan_roms(selected);
+        if (screen == 1 && now - last_rom_scan >= 1000) {
+            scan_roms(selected);
 
-		    if (rom_count == 0) {
-		        library_selected = 0;
-		        library_scroll = 0;
-		    } else {
-		        if (library_selected >= rom_count)
-		            library_selected = rom_count - 1;
+            if (rom_count == 0) {
+                library_selected = 0;
+                library_scroll = 0;
+            } else {
+                if (library_selected >= rom_count)
+                    library_selected = rom_count - 1;
 
-		        if (library_selected < library_scroll)
-		            library_scroll = library_selected;
+                if (library_selected < library_scroll)
+                    library_scroll = library_selected;
 
-		        if (library_selected >= library_scroll + VISIBLE_ROMS)
-		            library_scroll = library_selected - VISIBLE_ROMS + 1;
-		    }
+                if (library_selected >= library_scroll + VISIBLE_ROMS)
+                    library_scroll = library_selected - VISIBLE_ROMS + 1;
+            }
 
-		    last_rom_scan = now;
-		}
+            last_rom_scan = now;
+        }
 
-        /* Dibujar */
         SDL_SetRenderDrawColor(renderer, 17, 22, 32, 255);
         SDL_RenderClear(renderer);
 
@@ -704,11 +941,11 @@ int main(void)
             draw_card(renderer, 500, selected == 1, systems[1]);
             draw_card(renderer, 890, selected == 2, systems[2]);
 
-			draw_centered(renderer, 565, "CRUCETA MOVER",
-            			  (SDL_Color){160, 175, 195, 255}, 2);
+            draw_centered(renderer, 565, "CRUCETA MOVER",
+                          (SDL_Color){160, 175, 195, 255}, 2);
 
-			draw_centered(renderer, 610, "A ELEGIR",
-            			  (SDL_Color){160, 175, 195, 255}, 2);
+            draw_centered(renderer, 610, "A ELEGIR",
+                          (SDL_Color){160, 175, 195, 255}, 2);
 
         } else if (screen == 1) {
             draw_library(library_selected, library_scroll, selected);
